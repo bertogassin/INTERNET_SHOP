@@ -133,12 +133,41 @@
       grid-template-columns: repeat(3, 1fr);
       gap: 8px;
     }
+    .authGrid {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 8px;
+    }
+    .authQuick {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .authStatus {
+      font-size: 12px;
+      color: var(--muted);
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #0d1422;
+    }
+    .authStatus.ok {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .pwdRow {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 8px;
+    }
     @media (max-width: 1020px) {
       .wrap { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       .filters { grid-template-columns: 1fr; }
       .themePresets { grid-template-columns: 1fr; }
+      .authGrid { grid-template-columns: 1fr; }
+      .pwdRow { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -192,7 +221,20 @@
 
       <article class="panel stack">
         <h2 class="sectionTitle">Sell Shop Module</h2>
-        <input id="ownerTokenInput" placeholder="Owner token (required for owner actions)" />
+        <div class="authGrid">
+          <input id="authEmailInput" type="email" placeholder="Email" />
+          <input id="authPasswordInput" type="password" placeholder="Password" />
+          <button id="authLoginBtn" class="btn primary">Login</button>
+        </div>
+        <div class="authQuick">
+          <button id="authLogoutBtn" class="btn">Logout</button>
+        </div>
+        <div id="authStatus" class="authStatus">Auth: guest</div>
+        <div class="pwdRow">
+          <input id="pwdCurrentInput" type="password" placeholder="Current password" />
+          <input id="pwdNextInput" type="password" placeholder="New password (min 8)" />
+          <button id="pwdChangeBtn" class="btn">Change password</button>
+        </div>
         <div class="filters">
           <input id="askPriceInput" type="number" min="1" placeholder="Ask price USD" />
           <input id="gmvInput" type="number" min="0" placeholder="Monthly revenue USD" />
@@ -227,14 +269,23 @@
   </main>
 
   <script>
-    const API_BASE = 'http://127.0.0.1:4180';
-    const OWNER_TOKEN_STORAGE_KEY = 'internet_shop_owner_token';
+    const API_BASE =
+      (window.__INTERNET_SHOP_API_BASE__ || '').trim() ||
+      localStorage.getItem('internet_shop_api_base') ||
+      ((location.hostname === '127.0.0.1' || location.hostname === 'localhost')
+        ? 'http://127.0.0.1:4180'
+        : '');
+    const AUTH_ACCESS_STORAGE_KEY = 'internet_shop_auth_access';
+    const AUTH_REFRESH_STORAGE_KEY = 'internet_shop_auth_refresh';
     const state = {
       products: [],
       cart: JSON.parse(localStorage.getItem('internet_shop_cart') || '[]'),
       shop: { name: 'Internet Shop', tagline: '', accent: '#3dd9b3' },
       offers: [],
-      saleListing: null
+      saleListing: null,
+      authAccessToken: '',
+      authRefreshToken: '',
+      authUser: null
     };
 
     const catalogGrid = document.getElementById('catalogGrid');
@@ -244,35 +295,103 @@
     const shopTagline = document.getElementById('shopTagline');
     const offerList = document.getElementById('offerList');
 
-    function ownerToken() {
-      const v = document.getElementById('ownerTokenInput').value.trim();
-      return v || '';
-    }
-
-    function persistOwnerToken() {
-      localStorage.setItem(OWNER_TOKEN_STORAGE_KEY, ownerToken());
-    }
-
     async function api(path, options = {}) {
-      const { owner, ...fetchOptions } = options;
+      const { auth, retried, ...fetchOptions } = options;
       const headers = { 'Content-Type': 'application/json', ...(fetchOptions.headers || {}) };
-      if (owner) {
-        const token = ownerToken();
-        if (token) headers['x-owner-token'] = token;
+      if (auth && state.authAccessToken) {
+        headers.Authorization = `Bearer ${state.authAccessToken}`;
       }
       const res = await fetch(`${API_BASE}${path}`, {
         headers,
         ...fetchOptions
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error || `Request failed: ${res.status}`);
+      if (res.status === 401 && auth && !retried && state.authRefreshToken) {
+        const ok = await refreshSession();
+        if (ok) return api(path, { ...options, retried: true });
       }
+      if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`);
       return data;
     }
 
     function saveCart() {
       localStorage.setItem('internet_shop_cart', JSON.stringify(state.cart));
+    }
+
+    function saveAuthTokens() {
+      localStorage.setItem(AUTH_ACCESS_STORAGE_KEY, state.authAccessToken || '');
+      localStorage.setItem(AUTH_REFRESH_STORAGE_KEY, state.authRefreshToken || '');
+    }
+
+    function clearAuthTokens() {
+      state.authAccessToken = '';
+      state.authRefreshToken = '';
+      state.authUser = null;
+      localStorage.removeItem(AUTH_ACCESS_STORAGE_KEY);
+      localStorage.removeItem(AUTH_REFRESH_STORAGE_KEY);
+      renderAuthStatus();
+    }
+
+    async function refreshSession() {
+      if (!state.authRefreshToken) return false;
+      try {
+        const res = await fetch(`${API_BASE}/api/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: state.authRefreshToken })
+        });
+        if (!res.ok) return false;
+        const data = await res.json();
+        state.authAccessToken = data.access_token;
+        state.authRefreshToken = data.refresh_token;
+        saveAuthTokens();
+        return true;
+      } catch (_err) {
+        return false;
+      }
+    }
+
+    function renderAuthStatus() {
+      const status = document.getElementById('authStatus');
+      status.classList.remove('ok');
+      if (!state.authUser) {
+        status.textContent = 'Auth: guest (login for owner tools)';
+        return;
+      }
+      status.classList.add('ok');
+      status.textContent = `Auth: ${state.authUser.email} (${state.authUser.role})`;
+    }
+
+    async function restoreAuth() {
+      state.authAccessToken = localStorage.getItem(AUTH_ACCESS_STORAGE_KEY) || '';
+      state.authRefreshToken = localStorage.getItem(AUTH_REFRESH_STORAGE_KEY) || '';
+      if (!state.authAccessToken && state.authRefreshToken) {
+        await refreshSession();
+      }
+      if (!state.authAccessToken) {
+        clearAuthTokens();
+        return;
+      }
+      try {
+        const me = await api('/api/auth/me', { auth: true });
+        state.authUser = me.user;
+      } catch (_err) {
+        clearAuthTokens();
+      }
+      renderAuthStatus();
+    }
+
+    async function login(email, password) {
+      const auth = await api('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password })
+      });
+      state.authAccessToken = auth.access_token;
+      state.authRefreshToken = auth.refresh_token;
+      state.authUser = auth.user;
+      saveAuthTokens();
+      renderAuthStatus();
+      await refreshOffers();
     }
 
     function applyTheme() {
@@ -349,9 +468,18 @@
       `).join('');
     }
 
+    async function refreshOffers() {
+      try {
+        const offersRes = await api('/api/sale/offers', { auth: true });
+        state.offers = offersRes.offers;
+      } catch (_err) {
+        state.offers = [];
+      }
+      renderOffers();
+    }
+
     async function bootstrap() {
-      const tokenInput = document.getElementById('ownerTokenInput');
-      tokenInput.value = localStorage.getItem(OWNER_TOKEN_STORAGE_KEY) || 'dev-owner-token';
+      await restoreAuth();
       try {
         const [shopRes, productsRes, listingRes] = await Promise.all([
           api('/api/shop'),
@@ -368,16 +496,6 @@
       } catch (err) {
         alert(`Backend unavailable: ${err.message}`);
       }
-    }
-
-    async function refreshOffers() {
-      try {
-        const offersRes = await api('/api/sale/offers', { owner: true });
-        state.offers = offersRes.offers;
-      } catch (err) {
-        state.offers = [];
-      }
-      renderOffers();
     }
 
     window.addToCart = function addToCart(id) {
@@ -401,7 +519,7 @@
 
     window.approveOffer = async function approveOffer(id) {
       try {
-        await api(`/api/sale/offers/${id}/approve`, { method: 'POST', owner: true });
+        await api(`/api/sale/offers/${id}/approve`, { method: 'POST', auth: true });
         await refreshOffers();
       } catch (err) {
         alert(err.message);
@@ -431,7 +549,7 @@
       try {
         const res = await api('/api/shop/settings', {
           method: 'PATCH',
-          owner: true,
+          auth: true,
           body: JSON.stringify({
             name: state.shop.name,
             tagline: state.shop.tagline,
@@ -440,7 +558,7 @@
         });
         state.shop = res.shop;
         applyTheme();
-        alert('Style profile saved on backend.');
+        alert('Style profile saved.');
       } catch (err) {
         alert(err.message);
       }
@@ -451,28 +569,21 @@
       const gmv = Number(document.getElementById('gmvInput').value || 0);
       const traffic = Number(document.getElementById('trafficInput').value || 0);
       const note = document.getElementById('saleNoteInput').value.trim();
-      if (ask <= 0) {
-        alert('Enter ask price.');
-        return;
-      }
+      if (ask <= 0) return alert('Enter ask price.');
       try {
-        const res = await api('/api/sale/listing', {
+        await api('/api/sale/listing', {
           method: 'POST',
-          owner: true,
+          auth: true,
           body: JSON.stringify({ ask, gmv, traffic, note })
         });
-        state.saleListing = res.listing;
-        alert('Sale listing published to backend.');
+        alert('Sale listing published.');
       } catch (err) {
         alert(err.message);
       }
     });
 
     document.getElementById('checkoutBtn').addEventListener('click', async () => {
-      if (state.cart.length === 0) {
-        alert('Cart is empty.');
-        return;
-      }
+      if (state.cart.length === 0) return alert('Cart is empty.');
       const email = document.getElementById('emailInput').value.trim();
       try {
         const res = await api('/api/checkout', {
@@ -494,9 +605,50 @@
       renderCart();
     });
 
-    document.getElementById('ownerTokenInput').addEventListener('change', async () => {
-      persistOwnerToken();
+    document.getElementById('authLoginBtn').addEventListener('click', async () => {
+      const email = document.getElementById('authEmailInput').value.trim().toLowerCase();
+      const password = document.getElementById('authPasswordInput').value;
+      if (!email || !password) return alert('Enter email and password.');
+      try {
+        await login(email, password);
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('authLogoutBtn').addEventListener('click', async () => {
+      try {
+        if (state.authAccessToken) {
+          await api('/api/auth/logout', {
+            method: 'POST',
+            auth: true,
+            body: JSON.stringify({ refresh_token: state.authRefreshToken })
+          });
+        }
+      } catch (_err) {}
+      clearAuthTokens();
       await refreshOffers();
+    });
+
+    document.getElementById('pwdChangeBtn').addEventListener('click', async () => {
+      const current_password = document.getElementById('pwdCurrentInput').value;
+      const new_password = document.getElementById('pwdNextInput').value;
+      if (!current_password || !new_password) return alert('Enter current and new password.');
+      try {
+        const res = await api('/api/auth/password/change', {
+          method: 'POST',
+          auth: true,
+          body: JSON.stringify({ current_password, new_password })
+        });
+        if (res.reauth_required) {
+          clearAuthTokens();
+          await refreshOffers();
+          alert('Password changed. Please login again.');
+          return;
+        }
+      } catch (err) {
+        alert(err.message);
+      }
     });
 
     bootstrap();

@@ -1,14 +1,18 @@
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
     Json, Router,
 };
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use rand::{distributions::Alphanumeric, Rng};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -17,10 +21,16 @@ use std::{
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+const ACCESS_TTL_SECONDS: usize = 15 * 60;
+const REFRESH_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const LOGIN_WINDOW_MS: i64 = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS: usize = 8;
+
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
-    owner_token: String,
+    jwt_secret: String,
+    login_attempts: Arc<Mutex<HashMap<String, Vec<i64>>>>,
 }
 
 #[derive(Debug)]
@@ -58,6 +68,84 @@ struct HealthResponse<'a> {
     status: &'a str,
     service: &'a str,
     storage: &'a str,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Role {
+    Owner,
+    Staff,
+    Viewer,
+}
+
+impl Role {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "owner" => Some(Role::Owner),
+            "staff" => Some(Role::Staff),
+            "viewer" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: i64,
+    email: String,
+    role: Role,
+    sid: i64,
+    typ: String,
+    iat: usize,
+    exp: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AuthUser {
+    id: i64,
+    email: String,
+    role: Role,
+}
+
+#[derive(Debug, Clone)]
+struct AuthContext {
+    user: AuthUser,
+    session_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogoutRequest {
+    refresh_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasswordChangeRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TokensResponse {
+    access_token: String,
+    refresh_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    access_token: String,
+    refresh_token: String,
+    user: AuthUser,
 }
 
 #[derive(Serialize)]
@@ -161,21 +249,172 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn owner_only(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
-    let token = headers
-        .get("x-owner-token")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    if token != state.owner_token {
+fn now_s() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as usize)
+        .unwrap_or(0)
+}
+
+fn hash_password(raw: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(raw.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+fn random_token(len: usize) -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    if auth.len() < 8 || !auth.to_ascii_lowercase().starts_with("bearer ") {
+        return None;
+    }
+    Some(auth[7..].trim().to_string())
+}
+
+fn request_fingerprint(headers: &HeaderMap, email: &str) -> String {
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .unwrap_or("local");
+    format!("{}|{}", email.to_lowercase(), ip)
+}
+
+async fn check_login_rate_limit(state: &AppState, key: &str) -> Result<(), ApiError> {
+    let mut map = state.login_attempts.lock().await;
+    let now = now_ms();
+    let slot = map.entry(key.to_string()).or_default();
+    slot.retain(|ts| now - *ts <= LOGIN_WINDOW_MS);
+    if slot.len() >= LOGIN_MAX_ATTEMPTS {
         return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "owner token required",
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many login attempts, retry later",
         ));
     }
     Ok(())
 }
 
-fn init_schema(conn: &Connection) -> Result<(), ApiError> {
+async fn mark_login_failure(state: &AppState, key: &str) {
+    let mut map = state.login_attempts.lock().await;
+    let now = now_ms();
+    map.entry(key.to_string()).or_default().push(now);
+}
+
+async fn clear_login_failures(state: &AppState, key: &str) {
+    let mut map = state.login_attempts.lock().await;
+    map.remove(key);
+}
+
+fn issue_access_token(
+    state: &AppState,
+    user_id: i64,
+    email: &str,
+    role: Role,
+    session_id: i64,
+) -> Result<String, ApiError> {
+    let iat = now_s();
+    let claims = Claims {
+        sub: user_id,
+        email: email.to_string(),
+        role,
+        sid: session_id,
+        typ: "access".to_string(),
+        iat,
+        exp: iat + ACCESS_TTL_SECONDS,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+    )
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to issue token"))
+}
+
+async fn auth_context_from_headers(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<AuthContext, ApiError> {
+    let token = extract_bearer_token(headers)
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "bearer token required"))?;
+
+    let decoded = decode::<Claims>(
+        &token,
+        &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &Validation::new(Algorithm::HS256),
+    )
+    .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "invalid token"))?;
+    let claims = decoded.claims;
+    if claims.typ != "access" {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid token type",
+        ));
+    }
+
+    let conn = state.db.lock().await;
+    let user_row: Option<(i64, String, String, String)> = conn
+        .query_row(
+            "SELECT id, email, role, status FROM users WHERE id = ?",
+            [claims.sub],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let (id, email, role_raw, status) =
+        user_row.ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "user no longer exists"))?;
+    if status != "active" {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "user is not active"));
+    }
+    let role = Role::parse(&role_raw)
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "invalid user role"))?;
+
+    let sess: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT status, expires_at FROM auth_sessions WHERE id = ? AND user_id = ?",
+            params![claims.sid, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (sess_status, sess_exp) =
+        sess.ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "session not found"))?;
+    if sess_status != "active" || sess_exp <= now_ms() {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "session expired"));
+    }
+    if role != claims.role || email.to_lowercase() != claims.email.to_lowercase() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "token no longer valid",
+        ));
+    }
+
+    Ok(AuthContext {
+        user: AuthUser { id, email, role },
+        session_id: claims.sid,
+    })
+}
+
+fn enforce_role(user: &AuthUser, allowed: &[Role]) -> Result<(), ApiError> {
+    if allowed.contains(&user.role) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "insufficient role permissions",
+        ))
+    }
+}
+
+fn init_schema(conn: &Connection, seed_demo_users: bool) -> Result<(), ApiError> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS shop_settings (
@@ -184,7 +423,6 @@ fn init_schema(conn: &Connection) -> Result<(), ApiError> {
           tagline TEXT NOT NULL DEFAULT '',
           accent TEXT NOT NULL DEFAULT '#3dd9b3'
         );
-
         CREATE TABLE IF NOT EXISTS products (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           title TEXT NOT NULL,
@@ -194,14 +432,12 @@ fn init_schema(conn: &Connection) -> Result<(), ApiError> {
           desc TEXT NOT NULL DEFAULT '',
           created_at INTEGER NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS orders (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT NOT NULL DEFAULT '',
           total REAL NOT NULL,
           created_at INTEGER NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS order_items (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
@@ -210,7 +446,6 @@ fn init_schema(conn: &Connection) -> Result<(), ApiError> {
           price REAL NOT NULL,
           qty INTEGER NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS sale_listing (
           id INTEGER PRIMARY KEY CHECK (id = 1),
           ask REAL NOT NULL,
@@ -220,13 +455,29 @@ fn init_schema(conn: &Connection) -> Result<(), ApiError> {
           status TEXT NOT NULL DEFAULT 'active',
           updated_at INTEGER NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS sale_offers (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           buyer TEXT NOT NULL,
           offer REAL NOT NULL,
           status TEXT NOT NULL DEFAULT 'pending',
           created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT NOT NULL UNIQUE,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          refresh_hash TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL DEFAULT 'active',
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          last_seen_at INTEGER NOT NULL
         );
         "#,
     )?;
@@ -242,7 +493,6 @@ fn init_schema(conn: &Connection) -> Result<(), ApiError> {
                 "#3dd9b3"
             ],
         )?;
-
         let seed_products = vec![
             (
                 "Neo Jacket",
@@ -287,14 +537,12 @@ fn init_schema(conn: &Connection) -> Result<(), ApiError> {
                 "Modular shelf with hidden cable path.",
             ),
         ];
-
         for p in seed_products {
             conn.execute(
                 "INSERT INTO products (title, category, price, popularity, desc, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 params![p.0, p.1, p.2, p.3, p.4, ts],
             )?;
         }
-
         conn.execute(
             "INSERT INTO sale_offers (buyer, offer, status, created_at) VALUES (?, ?, ?, ?)",
             params![
@@ -314,6 +562,29 @@ fn init_schema(conn: &Connection) -> Result<(), ApiError> {
             ],
         )?;
     }
+
+    let users_count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+    if users_count == 0 && seed_demo_users {
+        let ts = now_ms();
+        conn.execute(
+            "INSERT INTO users (email, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            params!["owner@internet.shop", hash_password("Owner123!"), "owner", "active", ts],
+        )?;
+        conn.execute(
+            "INSERT INTO users (email, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            params!["staff@internet.shop", hash_password("Staff123!"), "staff", "active", ts],
+        )?;
+        conn.execute(
+            "INSERT INTO users (email, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?)",
+            params!["viewer@internet.shop", hash_password("Viewer123!"), "viewer", "active", ts],
+        )?;
+    }
+    if users_count == 0 && !seed_demo_users {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "users table is empty and demo seeding is disabled",
+        ));
+    }
     Ok(())
 }
 
@@ -323,6 +594,187 @@ async fn health() -> Json<HealthResponse<'static>> {
         service: "internet-shop-backend",
         storage: "sqlite",
     })
+}
+
+async fn post_auth_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, ApiError> {
+    let email = payload.email.trim().to_lowercase();
+    let password = payload.password.trim().to_string();
+    if email.is_empty() || password.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "email and password required",
+        ));
+    }
+
+    let fp = request_fingerprint(&headers, &email);
+    check_login_rate_limit(&state, &fp).await?;
+
+    let conn = state.db.lock().await;
+    let user_row: Option<(i64, String, String, String, String)> = conn
+        .query_row(
+            "SELECT id, email, password_hash, role, status FROM users WHERE lower(email)=lower(?)",
+            [email.clone()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+
+    let (id, db_email, db_hash, role_raw, status) = match user_row {
+        Some(v) => v,
+        None => {
+            mark_login_failure(&state, &fp).await;
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid credentials",
+            ));
+        }
+    };
+    if status != "active" || db_hash != hash_password(&password) {
+        mark_login_failure(&state, &fp).await;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid credentials",
+        ));
+    }
+    clear_login_failures(&state, &fp).await;
+    let role = Role::parse(&role_raw)
+        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid role"))?;
+
+    let refresh = random_token(64);
+    let refresh_hash = hash_password(&refresh);
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO auth_sessions (user_id, refresh_hash, status, created_at, expires_at, last_seen_at) VALUES (?, ?, 'active', ?, ?, ?)",
+        params![id, refresh_hash, now, now + REFRESH_TTL_MS, now],
+    )?;
+    let sid = conn.last_insert_rowid();
+    let access = issue_access_token(&state, id, &db_email, role, sid)?;
+
+    Ok(Json(LoginResponse {
+        access_token: access,
+        refresh_token: refresh,
+        user: AuthUser {
+            id,
+            email: db_email,
+            role,
+        },
+    }))
+}
+
+async fn post_auth_refresh(
+    State(state): State<AppState>,
+    Json(payload): Json<RefreshRequest>,
+) -> Result<Json<TokensResponse>, ApiError> {
+    let token = payload.refresh_token.trim().to_string();
+    if token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "refresh token required",
+        ));
+    }
+    let token_hash = hash_password(&token);
+    let conn = state.db.lock().await;
+    let row: Option<(i64, i64, i64, String, String, String)> = conn
+        .query_row(
+            "SELECT s.id, u.id, s.expires_at, s.status, u.email, u.role FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.refresh_hash=?",
+            [token_hash],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()?;
+    let (sid, uid, exp_at, status, email, role_raw) =
+        row.ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "invalid refresh token"))?;
+    if status != "active" || exp_at <= now_ms() {
+        conn.execute(
+            "UPDATE auth_sessions SET status='revoked' WHERE id=?",
+            [sid],
+        )?;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "refresh token expired",
+        ));
+    }
+    let role = Role::parse(&role_raw)
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "invalid role"))?;
+    let next_refresh = random_token(64);
+    let now = now_ms();
+    conn.execute(
+        "UPDATE auth_sessions SET refresh_hash=?, expires_at=?, last_seen_at=? WHERE id=?",
+        params![hash_password(&next_refresh), now + REFRESH_TTL_MS, now, sid],
+    )?;
+    let access = issue_access_token(&state, uid, &email, role, sid)?;
+    Ok(Json(TokensResponse {
+        access_token: access,
+        refresh_token: next_refresh,
+    }))
+}
+
+async fn post_auth_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<LogoutRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let ctx = auth_context_from_headers(&headers, &state).await?;
+    let conn = state.db.lock().await;
+    conn.execute(
+        "UPDATE auth_sessions SET status='revoked', last_seen_at=? WHERE id=?",
+        params![now_ms(), ctx.session_id],
+    )?;
+    if let Some(refresh) = payload.refresh_token {
+        let hash = hash_password(refresh.trim());
+        conn.execute(
+            "UPDATE auth_sessions SET status='revoked', last_seen_at=? WHERE refresh_hash=?",
+            params![now_ms(), hash],
+        )?;
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn post_auth_password_change(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<PasswordChangeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let ctx = auth_context_from_headers(&headers, &state).await?;
+    let current = payload.current_password.trim().to_string();
+    let next = payload.new_password.trim().to_string();
+    if current.is_empty() || next.len() < 8 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "current password required and new password must be at least 8 chars",
+        ));
+    }
+    let conn = state.db.lock().await;
+    let old_hash: String = conn.query_row(
+        "SELECT password_hash FROM users WHERE id=?",
+        [ctx.user.id],
+        |r| r.get(0),
+    )?;
+    if old_hash != hash_password(&current) {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "current password is incorrect",
+        ));
+    }
+    conn.execute(
+        "UPDATE users SET password_hash=? WHERE id=?",
+        params![hash_password(&next), ctx.user.id],
+    )?;
+    conn.execute(
+        "UPDATE auth_sessions SET status='revoked', last_seen_at=? WHERE user_id=?",
+        params![now_ms(), ctx.user.id],
+    )?;
+    Ok(Json(json!({"ok": true, "reauth_required": true})))
+}
+
+async fn get_auth_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let ctx = auth_context_from_headers(&headers, &state).await?;
+    Ok(Json(json!({ "user": ctx.user })))
 }
 
 async fn get_shop(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -340,7 +792,6 @@ async fn get_shop(State(state): State<AppState>) -> Result<Json<Value>, ApiError
             },
         )
         .optional()?;
-
     let shop = if let Some(s) = shop_opt {
         s
     } else {
@@ -354,7 +805,6 @@ async fn get_shop(State(state): State<AppState>) -> Result<Json<Value>, ApiError
             accent: "#3dd9b3".to_string(),
         }
     };
-
     Ok(Json(json!({ "shop": shop })))
 }
 
@@ -363,9 +813,9 @@ async fn patch_shop_settings(
     headers: HeaderMap,
     Json(payload): Json<ShopPatch>,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&headers, &state)?;
+    let ctx = auth_context_from_headers(&headers, &state).await?;
+    enforce_role(&ctx.user, &[Role::Owner, Role::Staff])?;
     let conn = state.db.lock().await;
-
     let current: Option<Shop> = conn
         .query_row(
             "SELECT name, tagline, accent FROM shop_settings WHERE id = 1",
@@ -379,7 +829,6 @@ async fn patch_shop_settings(
             },
         )
         .optional()?;
-
     let next = Shop {
         name: payload
             .name
@@ -411,13 +860,10 @@ async fn patch_shop_settings(
             .or_else(|| current.as_ref().map(|c| c.accent.clone()))
             .unwrap_or_else(|| "#3dd9b3".to_string()),
     };
-
     conn.execute(
-        "INSERT INTO shop_settings (id, name, tagline, accent) VALUES (1, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET name = excluded.name, tagline = excluded.tagline, accent = excluded.accent",
+        "INSERT INTO shop_settings (id, name, tagline, accent) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, tagline=excluded.tagline, accent=excluded.accent",
         params![next.name, next.tagline, next.accent],
     )?;
-
     Ok(Json(json!({ "ok": true, "shop": next })))
 }
 
@@ -448,7 +894,8 @@ async fn post_products(
     headers: HeaderMap,
     Json(payload): Json<ProductCreate>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    owner_only(&headers, &state)?;
+    let ctx = auth_context_from_headers(&headers, &state).await?;
+    enforce_role(&ctx.user, &[Role::Owner, Role::Staff])?;
     let title = payload.title.trim().to_string();
     if title.is_empty() || payload.price < 0.0 {
         return Err(ApiError::new(
@@ -456,7 +903,6 @@ async fn post_products(
             "title and non-negative price required",
         ));
     }
-
     let conn = state.db.lock().await;
     conn.execute(
         "INSERT INTO products (title, category, price, popularity, desc, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -471,7 +917,7 @@ async fn post_products(
     )?;
     let id = conn.last_insert_rowid();
     let product: Product = conn.query_row(
-        "SELECT id, title, category, price, popularity, desc FROM products WHERE id = ?",
+        "SELECT id, title, category, price, popularity, desc FROM products WHERE id=?",
         [id],
         |r| {
             Ok(Product {
@@ -484,7 +930,6 @@ async fn post_products(
             })
         },
     )?;
-
     Ok((StatusCode::CREATED, Json(json!({ "product": product }))))
 }
 
@@ -495,38 +940,33 @@ async fn post_checkout(
     if payload.items.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "items required"));
     }
-
     let mut conn = state.db.lock().await;
     let mut normalized = Vec::<CheckoutItem>::new();
     let mut total = 0.0_f64;
-
     for item in payload.items {
-        let qty = item.qty;
-        if qty <= 0 {
+        if item.qty <= 0 {
             continue;
         }
         let row: Option<(i64, String, f64)> = conn
             .query_row(
-                "SELECT id, title, price FROM products WHERE id = ?",
+                "SELECT id, title, price FROM products WHERE id=?",
                 [item.id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         if let Some((id, title, price)) = row {
-            total += price * qty as f64;
+            total += price * item.qty as f64;
             normalized.push(CheckoutItem {
                 product_id: id,
                 title,
                 price,
-                qty,
+                qty: item.qty,
             });
         }
     }
-
     if normalized.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "no valid items"));
     }
-
     let created_at = now_ms();
     let email = payload.email.unwrap_or_default().trim().to_string();
     let tx = conn.transaction()?;
@@ -542,7 +982,6 @@ async fn post_checkout(
         )?;
     }
     tx.commit()?;
-
     let order = OrderResponse {
         id: order_id,
         email,
@@ -550,7 +989,6 @@ async fn post_checkout(
         created_at,
         items: normalized,
     };
-
     Ok((
         StatusCode::CREATED,
         Json(json!({ "ok": true, "order": order })),
@@ -561,7 +999,7 @@ async fn get_sale_listing(State(state): State<AppState>) -> Result<Json<Value>, 
     let conn = state.db.lock().await;
     let listing: Option<SaleListing> = conn
         .query_row(
-            "SELECT ask, gmv, traffic, note, status, updated_at FROM sale_listing WHERE id = 1",
+            "SELECT ask, gmv, traffic, note, status, updated_at FROM sale_listing WHERE id=1",
             [],
             |r| {
                 Ok(SaleListing {
@@ -583,7 +1021,8 @@ async fn post_sale_listing(
     headers: HeaderMap,
     Json(payload): Json<SaleListingUpsert>,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&headers, &state)?;
+    let ctx = auth_context_from_headers(&headers, &state).await?;
+    enforce_role(&ctx.user, &[Role::Owner])?;
     if payload.ask <= 0.0 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -593,8 +1032,7 @@ async fn post_sale_listing(
     let conn = state.db.lock().await;
     let now = now_ms();
     conn.execute(
-        "INSERT INTO sale_listing (id, ask, gmv, traffic, note, status, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET ask = excluded.ask, gmv = excluded.gmv, traffic = excluded.traffic, note = excluded.note, status = excluded.status, updated_at = excluded.updated_at",
+        "INSERT INTO sale_listing (id, ask, gmv, traffic, note, status, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET ask=excluded.ask, gmv=excluded.gmv, traffic=excluded.traffic, note=excluded.note, status=excluded.status, updated_at=excluded.updated_at",
         params![
             payload.ask,
             payload.gmv.unwrap_or(0.0),
@@ -605,7 +1043,7 @@ async fn post_sale_listing(
         ],
     )?;
     let listing: SaleListing = conn.query_row(
-        "SELECT ask, gmv, traffic, note, status, updated_at FROM sale_listing WHERE id = 1",
+        "SELECT ask, gmv, traffic, note, status, updated_at FROM sale_listing WHERE id=1",
         [],
         |r| {
             Ok(SaleListing {
@@ -625,7 +1063,8 @@ async fn get_sale_offers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&headers, &state)?;
+    let ctx = auth_context_from_headers(&headers, &state).await?;
+    enforce_role(&ctx.user, &[Role::Owner, Role::Staff])?;
     let conn = state.db.lock().await;
     let mut stmt = conn
         .prepare("SELECT id, buyer, offer, status, created_at FROM sale_offers ORDER BY id DESC")?;
@@ -656,7 +1095,6 @@ async fn post_sale_offer(
             "buyer and offer required",
         ));
     }
-
     let conn = state.db.lock().await;
     conn.execute(
         "INSERT INTO sale_offers (buyer, offer, status, created_at) VALUES (?, ?, ?, ?)",
@@ -664,7 +1102,7 @@ async fn post_sale_offer(
     )?;
     let id = conn.last_insert_rowid();
     let offer: SaleOffer = conn.query_row(
-        "SELECT id, buyer, offer, status, created_at FROM sale_offers WHERE id = ?",
+        "SELECT id, buyer, offer, status, created_at FROM sale_offers WHERE id=?",
         [id],
         |r| {
             Ok(SaleOffer {
@@ -684,11 +1122,12 @@ async fn approve_sale_offer(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&headers, &state)?;
+    let ctx = auth_context_from_headers(&headers, &state).await?;
+    enforce_role(&ctx.user, &[Role::Owner])?;
     let mut conn = state.db.lock().await;
-    let row: Option<SaleOffer> = conn
+    let current: Option<SaleOffer> = conn
         .query_row(
-            "SELECT id, buyer, offer, status, created_at FROM sale_offers WHERE id = ?",
+            "SELECT id, buyer, offer, status, created_at FROM sale_offers WHERE id=?",
             [id],
             |r| {
                 Ok(SaleOffer {
@@ -701,35 +1140,27 @@ async fn approve_sale_offer(
             },
         )
         .optional()?;
-
-    let current = match row {
-        Some(r) => r,
-        None => return Err(ApiError::new(StatusCode::NOT_FOUND, "offer not found")),
-    };
-    if current.status != "pending" {
+    let existing =
+        current.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "offer not found"))?;
+    if existing.status != "pending" {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "offer already processed",
         ));
     }
-
     let tx = conn.transaction()?;
+    tx.execute("UPDATE sale_offers SET status='approved' WHERE id=?", [id])?;
     tx.execute(
-        "UPDATE sale_offers SET status = 'approved' WHERE id = ?",
+        "UPDATE sale_offers SET status='rejected' WHERE status='pending' AND id<>?",
         [id],
     )?;
     tx.execute(
-        "UPDATE sale_offers SET status = 'rejected' WHERE status = 'pending' AND id <> ?",
-        [id],
-    )?;
-    tx.execute(
-        "UPDATE sale_listing SET status = 'sold', updated_at = ? WHERE id = 1",
+        "UPDATE sale_listing SET status='sold', updated_at=? WHERE id=1",
         [now_ms()],
     )?;
     tx.commit()?;
-
     let approved: SaleOffer = conn.query_row(
-        "SELECT id, buyer, offer, status, created_at FROM sale_offers WHERE id = ?",
+        "SELECT id, buyer, offer, status, created_at FROM sale_offers WHERE id=?",
         [id],
         |r| {
             Ok(SaleOffer {
@@ -746,28 +1177,73 @@ async fn approve_sale_offer(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(4180);
-    let owner_token =
-        std::env::var("OWNER_TOKEN").unwrap_or_else(|_| "dev-owner-token".to_string());
+    let bind_host = std::env::var("BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let jwt_secret =
+        std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev-jwt-secret-change-me".to_string());
+    let seed_demo_users =
+        std::env::var("SEED_DEMO_USERS").unwrap_or_else(|_| "true".to_string()) == "true";
+    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "data/store.sqlite".to_string());
 
-    let data_dir = PathBuf::from("data");
+    if app_env == "production" && jwt_secret == "dev-jwt-secret-change-me" {
+        return Err("JWT_SECRET must be set in production".into());
+    }
+
+    let db_file = PathBuf::from(&db_path);
+    let data_dir = db_file
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"));
     if !data_dir.exists() {
         std::fs::create_dir_all(&data_dir)?;
     }
-    let db_path = data_dir.join("store.sqlite");
-    let conn = Connection::open(db_path)?;
-    init_schema(&conn).map_err(|e| format!("init schema failed: {}", e.message))?;
+    let conn = Connection::open(&db_file)?;
+    init_schema(&conn, seed_demo_users)
+        .map_err(|e| format!("init schema failed: {}", e.message))?;
 
     let state = AppState {
         db: Arc::new(Mutex::new(conn)),
-        owner_token: owner_token.clone(),
+        jwt_secret: jwt_secret.clone(),
+        login_attempts: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let cors_origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
+    let cors_layer = if cors_origins.trim().is_empty() {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        let origins: Vec<HeaderValue> = cors_origins
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<HeaderValue>().ok())
+            .collect();
+        if origins.is_empty() {
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        } else {
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
     };
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/api/auth/login", post(post_auth_login))
+        .route("/api/auth/refresh", post(post_auth_refresh))
+        .route("/api/auth/logout", post(post_auth_logout))
+        .route("/api/auth/password/change", post(post_auth_password_change))
+        .route("/api/auth/me", get(get_auth_me))
         .route("/api/shop", get(get_shop))
         .route("/api/shop/settings", patch(patch_shop_settings))
         .route("/api/products", get(get_products).post(post_products))
@@ -781,17 +1257,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_sale_offers).post(post_sale_offer),
         )
         .route("/api/sale/offers/{id}/approve", post(approve_sale_offer))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(cors_layer)
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr: SocketAddr = format!("{bind_host}:{port}").parse()?;
     println!("Internet Shop backend (Rust) listening on http://{}", addr);
-    println!("Owner token: {}", owner_token);
+    println!("Environment: {}", app_env);
+    println!("JWT secret loaded (len={} chars)", jwt_secret.len());
+    println!("Demo user seeding: {}", seed_demo_users);
+    println!("DB path: {}", db_path);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

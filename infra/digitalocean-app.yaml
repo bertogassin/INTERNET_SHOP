@@ -1,0 +1,50 @@
+name: internet-shop
+region: fra
+services:
+  - name: internet-shop-api
+    github:
+      repo: bertogassin/INTERNET_SHOP
+      branch: main
+      deploy_on_push: true
+    source_dir: backend
+    dockerfile_path: Dockerfile
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    routes:
+      - path: /api
+      - path: /health
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 15
+      period_seconds: 10
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 3
+    envs:
+      - key: APP_ENV
+        value: production
+      - key: PORT
+        value: "8080"
+      - key: BIND_HOST
+        value: 0.0.0.0
+      - key: DB_PATH
+        value: /app/data/store.sqlite
+      - key: SEED_DEMO_USERS
+        value: "false"
+      - key: CORS_ORIGINS
+        value: https://internet-shop.example.com
+      - key: JWT_SECRET
+        type: SECRET
+        value: change-me
+static_sites:
+  - name: internet-shop-web
+    github:
+      repo: bertogassin/INTERNET_SHOP
+      branch: main
+      deploy_on_push: true
+    source_dir: frontend
+    build_command: npm ci && npm run build
+    output_dir: dist
+    routes:
+      - path: /

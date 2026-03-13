@@ -23,8 +23,9 @@ infra/          # docker/deploy/runtime configs
 docs/           # contracts, rollout, security notes
 ```
 
-## Next steps
+## Production readiness
 
-1. Initialize git and create GitHub repo `INTERNET_SHOP`.
-2. Move Internet Shop product code only here.
-3. Keep `OMNIXIUS` with links to this repo and future shop domain.
+- Rust backend with JWT auth, RBAC, refresh/logout/password-change flows.
+- Frontend connected to backend API with refresh-token retry flow.
+- Dockerized backend runtime for deployment.
+- DigitalOcean App Platform spec in `infra/digitalocean-app.yaml`.
