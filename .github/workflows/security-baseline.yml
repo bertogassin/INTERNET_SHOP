@@ -1,0 +1,44 @@
+name: Security Baseline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  rust-security:
+    name: Rust build and security checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build checks
+        run: cargo fmt --all -- --check && cargo check --all-targets
+      - name: Vulnerability checks
+        run: cargo install cargo-audit --locked && cargo audit
+
+  frontend-audit:
+    name: Frontend audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Node audit
+        run: npm ci && npm audit --audit-level=high || true
