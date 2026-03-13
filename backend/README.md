@@ -58,6 +58,7 @@ Data persistence:
 - `PORT=8080` and `BIND_HOST=0.0.0.0` for container runtime.
 - `DB_PATH=/app/data/store.sqlite` to control SQLite location.
 - `SEED_DEMO_USERS=false` to disable demo user bootstrap.
+- `BOOTSTRAP_OWNER_EMAIL=owner@your-domain` and `BOOTSTRAP_OWNER_PASSWORD=<strong-password>` for first owner creation when demo users are disabled.
 - `CORS_ORIGINS=https://your-frontend-domain` (comma-separated list supported).
 - `JWT_SECRET=<strong-random-secret>` required in production.
 
@@ -78,6 +79,8 @@ docker run --rm -p 8080:8080 \
   -e BIND_HOST=0.0.0.0 \
   -e DB_PATH=/app/data/store.sqlite \
   -e SEED_DEMO_USERS=false \
+  -e BOOTSTRAP_OWNER_EMAIL=owner@your-domain \
+  -e BOOTSTRAP_OWNER_PASSWORD=replace-with-strong-password \
   -e CORS_ORIGINS=https://your-frontend-domain \
   -e JWT_SECRET=replace-with-strong-secret \
   internet-shop-api

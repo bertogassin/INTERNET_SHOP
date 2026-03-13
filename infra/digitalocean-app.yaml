@@ -32,6 +32,11 @@ services:
         value: /app/data/store.sqlite
       - key: SEED_DEMO_USERS
         value: "false"
+      - key: BOOTSTRAP_OWNER_EMAIL
+        value: owner@internet.shop
+      - key: BOOTSTRAP_OWNER_PASSWORD
+        type: SECRET
+        value: change-owner-password
       - key: CORS_ORIGINS
         value: https://internet-shop.example.com
       - key: JWT_SECRET

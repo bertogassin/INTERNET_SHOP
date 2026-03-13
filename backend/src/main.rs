@@ -414,7 +414,11 @@ fn enforce_role(user: &AuthUser, allowed: &[Role]) -> Result<(), ApiError> {
     }
 }
 
-fn init_schema(conn: &Connection, seed_demo_users: bool) -> Result<(), ApiError> {
+fn init_schema(
+    conn: &Connection,
+    seed_demo_users: bool,
+    bootstrap_owner: Option<(&str, &str)>,
+) -> Result<(), ApiError> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS shop_settings (
@@ -580,10 +584,18 @@ fn init_schema(conn: &Connection, seed_demo_users: bool) -> Result<(), ApiError>
         )?;
     }
     if users_count == 0 && !seed_demo_users {
-        return Err(ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "users table is empty and demo seeding is disabled",
-        ));
+        if let Some((email, password)) = bootstrap_owner {
+            let ts = now_ms();
+            conn.execute(
+                "INSERT INTO users (email, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                params![email.trim().to_lowercase(), hash_password(password), "owner", "active", ts],
+            )?;
+        } else {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "users table is empty and demo seeding is disabled",
+            ));
+        }
     }
     Ok(())
 }
@@ -1188,6 +1200,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seed_demo_users =
         std::env::var("SEED_DEMO_USERS").unwrap_or_else(|_| "true".to_string()) == "true";
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "data/store.sqlite".to_string());
+    let bootstrap_owner_email = std::env::var("BOOTSTRAP_OWNER_EMAIL").ok();
+    let bootstrap_owner_password = std::env::var("BOOTSTRAP_OWNER_PASSWORD").ok();
+    let bootstrap_owner = match (bootstrap_owner_email, bootstrap_owner_password) {
+        (Some(email), Some(password))
+            if !email.trim().is_empty() && !password.trim().is_empty() =>
+        {
+            Some((email, password))
+        }
+        _ => None,
+    };
 
     if app_env == "production" && jwt_secret == "dev-jwt-secret-change-me" {
         return Err("JWT_SECRET must be set in production".into());
@@ -1202,8 +1224,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&data_dir)?;
     }
     let conn = Connection::open(&db_file)?;
-    init_schema(&conn, seed_demo_users)
-        .map_err(|e| format!("init schema failed: {}", e.message))?;
+    init_schema(
+        &conn,
+        seed_demo_users,
+        bootstrap_owner
+            .as_ref()
+            .map(|(email, password)| (email.as_str(), password.as_str())),
+    )
+    .map_err(|e| format!("init schema failed: {}", e.message))?;
 
     let state = AppState {
         db: Arc::new(Mutex::new(conn)),
@@ -1265,6 +1293,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Environment: {}", app_env);
     println!("JWT secret loaded (len={} chars)", jwt_secret.len());
     println!("Demo user seeding: {}", seed_demo_users);
+    println!(
+        "Bootstrap owner configured: {}",
+        if bootstrap_owner.is_some() {
+            "true"
+        } else {
+            "false"
+        }
+    );
     println!("DB path: {}", db_path);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
