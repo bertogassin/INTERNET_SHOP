@@ -34,3 +34,10 @@ __pycache__/
 .terraform/
 *.tfstate
 *.tfstate.*
+
+# Rust
+target/
+backend/target/
+
+# Runtime data
+backend/data/*.sqlite

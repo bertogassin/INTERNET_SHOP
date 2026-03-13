@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Internet Shop MVP</title>
+  <style>
+    :root {
+      --bg: #090d14;
+      --panel: #121a2a;
+      --line: #273b5a;
+      --text: #edf3ff;
+      --muted: #9eb1d2;
+      --accent: #3dd9b3;
+      --danger: #ff4d5f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: radial-gradient(circle at 20% 10%, #1a2c48, var(--bg));
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 22px 16px 36px;
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 14px;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(18, 26, 42, 0.9);
+      padding: 14px;
+    }
+    .kicker {
+      margin: 0;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    h1, h2, h3, p { margin: 0; }
+    .muted { color: var(--muted); }
+    .stack { display: grid; gap: 12px; }
+    .heroRow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      text-decoration: none;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      background: transparent;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn.primary { border-color: var(--accent); color: var(--accent); }
+    .btn.danger { border-color: var(--danger); color: var(--danger); }
+    .filters {
+      display: grid;
+      grid-template-columns: 1fr 140px 130px;
+      gap: 8px;
+    }
+    input, select, textarea {
+      width: 100%;
+      background: #0d1422;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 10px;
+      font-size: 13px;
+    }
+    textarea { resize: vertical; min-height: 90px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 10px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #0f1728;
+      padding: 12px;
+      display: grid;
+      gap: 8px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+    }
+    .price { color: var(--accent); font-weight: 700; }
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .cartList, .offerList {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+    }
+    .item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px;
+      display: grid;
+      gap: 6px;
+      background: #0f1728;
+    }
+    .tiny { font-size: 12px; color: var(--muted); }
+    .sectionTitle { margin-bottom: 8px; }
+    .themePresets {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    @media (max-width: 1020px) {
+      .wrap { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      .filters { grid-template-columns: 1fr; }
+      .themePresets { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="stack">
+      <article class="panel stack">
+        <div class="heroRow">
+          <div>
+            <p class="kicker">Internet Shop MVP</p>
+            <h1 id="shopName">Street Pulse Shop</h1>
+            <p id="shopTagline" class="muted">Trend-first storefront with flexible style and sell-shop module.</p>
+          </div>
+          <a class="btn" href="https://github.com/bertogassin/INTERNET_SHOP" target="_blank" rel="noreferrer">Repository</a>
+        </div>
+      </article>
+
+      <article class="panel stack">
+        <h2 class="sectionTitle">Storefront</h2>
+        <div class="filters">
+          <input id="searchInput" placeholder="Search products..." />
+          <select id="categoryFilter">
+            <option value="all">All categories</option>
+            <option value="fashion">Fashion</option>
+            <option value="tech">Tech</option>
+            <option value="home">Home</option>
+          </select>
+          <select id="sortFilter">
+            <option value="popular">Popular</option>
+            <option value="price-asc">Price ↑</option>
+            <option value="price-desc">Price ↓</option>
+          </select>
+        </div>
+        <div id="catalogGrid" class="grid"></div>
+      </article>
+
+      <article class="panel stack">
+        <h2 class="sectionTitle">Trend Builder</h2>
+        <div class="themePresets">
+          <button class="btn" data-theme="street">Street</button>
+          <button class="btn" data-theme="premium">Premium</button>
+          <button class="btn" data-theme="creator">Creator</button>
+        </div>
+        <div class="filters">
+          <input id="nameInput" placeholder="Shop name" />
+          <input id="taglineInput" placeholder="Tagline" />
+          <input id="accentInput" placeholder="#3dd9b3" />
+        </div>
+        <button id="saveThemeBtn" class="btn primary">Save style profile</button>
+      </article>
+
+      <article class="panel stack">
+        <h2 class="sectionTitle">Sell Shop Module</h2>
+        <input id="ownerTokenInput" placeholder="Owner token (required for owner actions)" />
+        <div class="filters">
+          <input id="askPriceInput" type="number" min="1" placeholder="Ask price USD" />
+          <input id="gmvInput" type="number" min="0" placeholder="Monthly revenue USD" />
+          <input id="trafficInput" type="number" min="0" placeholder="Monthly visitors" />
+        </div>
+        <textarea id="saleNoteInput" placeholder="Why this shop is valuable..."></textarea>
+        <button id="publishSaleBtn" class="btn primary">Publish sale listing</button>
+        <ul id="offerList" class="offerList"></ul>
+      </article>
+    </section>
+
+    <aside class="stack">
+      <article class="panel stack">
+        <h3>Cart</h3>
+        <ul id="cartList" class="cartList"></ul>
+        <div class="row">
+          <strong>Total</strong>
+          <strong id="cartTotal">$0.00</strong>
+        </div>
+        <input id="emailInput" type="email" placeholder="customer@email.com (optional)" />
+        <button id="checkoutBtn" class="btn primary">Checkout</button>
+        <button id="clearCartBtn" class="btn danger">Clear cart</button>
+      </article>
+      <article class="panel stack">
+        <h3>MVP Status</h3>
+        <p class="tiny">Model: single-brand</p>
+        <p class="tiny">Storefront: active</p>
+        <p class="tiny">Trend Builder: active</p>
+        <p class="tiny">Sell Store: active (manual transfer mode)</p>
+      </article>
+    </aside>
+  </main>
+
+  <script>
+    const API_BASE = 'http://127.0.0.1:4180';
+    const OWNER_TOKEN_STORAGE_KEY = 'internet_shop_owner_token';
+    const state = {
+      products: [],
+      cart: JSON.parse(localStorage.getItem('internet_shop_cart') || '[]'),
+      shop: { name: 'Internet Shop', tagline: '', accent: '#3dd9b3' },
+      offers: [],
+      saleListing: null
+    };
+
+    const catalogGrid = document.getElementById('catalogGrid');
+    const cartList = document.getElementById('cartList');
+    const cartTotal = document.getElementById('cartTotal');
+    const shopName = document.getElementById('shopName');
+    const shopTagline = document.getElementById('shopTagline');
+    const offerList = document.getElementById('offerList');
+
+    function ownerToken() {
+      const v = document.getElementById('ownerTokenInput').value.trim();
+      return v || '';
+    }
+
+    function persistOwnerToken() {
+      localStorage.setItem(OWNER_TOKEN_STORAGE_KEY, ownerToken());
+    }
+
+    async function api(path, options = {}) {
+      const { owner, ...fetchOptions } = options;
+      const headers = { 'Content-Type': 'application/json', ...(fetchOptions.headers || {}) };
+      if (owner) {
+        const token = ownerToken();
+        if (token) headers['x-owner-token'] = token;
+      }
+      const res = await fetch(`${API_BASE}${path}`, {
+        headers,
+        ...fetchOptions
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || `Request failed: ${res.status}`);
+      }
+      return data;
+    }
+
+    function saveCart() {
+      localStorage.setItem('internet_shop_cart', JSON.stringify(state.cart));
+    }
+
+    function applyTheme() {
+      document.documentElement.style.setProperty('--accent', state.shop.accent || '#3dd9b3');
+      shopName.textContent = state.shop.name || 'Internet Shop';
+      shopTagline.textContent = state.shop.tagline || '';
+      document.getElementById('nameInput').value = state.shop.name || '';
+      document.getElementById('taglineInput').value = state.shop.tagline || '';
+      document.getElementById('accentInput').value = state.shop.accent || '#3dd9b3';
+    }
+
+    function renderCatalog() {
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      const cat = document.getElementById('categoryFilter').value;
+      const sort = document.getElementById('sortFilter').value;
+      let list = state.products.filter((p) =>
+        (cat === 'all' || p.category === cat) &&
+        (q === '' || p.title.toLowerCase().includes(q) || (p.desc || '').toLowerCase().includes(q))
+      );
+      if (sort === 'price-asc') list = [...list].sort((a, b) => a.price - b.price);
+      if (sort === 'price-desc') list = [...list].sort((a, b) => b.price - a.price);
+      if (sort === 'popular') list = [...list].sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
+
+      catalogGrid.innerHTML = list.map((p) => `
+        <article class="card">
+          <div class="row">
+            <span class="badge">${p.category}</span>
+            <strong class="price">$${Number(p.price).toFixed(2)}</strong>
+          </div>
+          <h3>${p.title}</h3>
+          <p class="tiny">${p.desc || ''}</p>
+          <button class="btn primary" onclick="addToCart(${p.id})">Add to cart</button>
+        </article>
+      `).join('');
+    }
+
+    function renderCart() {
+      if (state.cart.length === 0) {
+        cartList.innerHTML = '<li class="item"><p class="tiny">Cart is empty.</p></li>';
+        cartTotal.textContent = '$0.00';
+        return;
+      }
+      cartList.innerHTML = state.cart.map((item, idx) => `
+        <li class="item">
+          <div class="row">
+            <strong>${item.title}</strong>
+            <span class="price">$${(item.price * item.qty).toFixed(2)}</span>
+          </div>
+          <div class="row">
+            <span class="tiny">Qty ${item.qty}</span>
+            <div class="row">
+              <button class="btn" onclick="changeQty(${idx}, -1)">-</button>
+              <button class="btn" onclick="changeQty(${idx}, 1)">+</button>
+            </div>
+          </div>
+        </li>
+      `).join('');
+      const total = state.cart.reduce((sum, i) => sum + i.price * i.qty, 0);
+      cartTotal.textContent = `$${total.toFixed(2)}`;
+    }
+
+    function renderOffers() {
+      offerList.innerHTML = state.offers.map((o) => `
+        <li class="item">
+          <div class="row">
+            <strong>${o.buyer}</strong>
+            <span class="price">$${Number(o.offer).toFixed(2)}</span>
+          </div>
+          <div class="row">
+            <span class="tiny">Status: ${o.status}</span>
+            <button class="btn" onclick="approveOffer(${o.id})" ${o.status !== 'pending' ? 'disabled' : ''}>Approve</button>
+          </div>
+        </li>
+      `).join('');
+    }
+
+    async function bootstrap() {
+      const tokenInput = document.getElementById('ownerTokenInput');
+      tokenInput.value = localStorage.getItem(OWNER_TOKEN_STORAGE_KEY) || 'dev-owner-token';
+      try {
+        const [shopRes, productsRes, listingRes] = await Promise.all([
+          api('/api/shop'),
+          api('/api/products'),
+          api('/api/sale/listing')
+        ]);
+        state.shop = shopRes.shop;
+        state.products = productsRes.products;
+        state.saleListing = listingRes.listing;
+        applyTheme();
+        renderCatalog();
+        renderCart();
+        await refreshOffers();
+      } catch (err) {
+        alert(`Backend unavailable: ${err.message}`);
+      }
+    }
+
+    async function refreshOffers() {
+      try {
+        const offersRes = await api('/api/sale/offers', { owner: true });
+        state.offers = offersRes.offers;
+      } catch (err) {
+        state.offers = [];
+      }
+      renderOffers();
+    }
+
+    window.addToCart = function addToCart(id) {
+      const p = state.products.find((x) => x.id === id);
+      if (!p) return;
+      const row = state.cart.find((x) => x.id === id);
+      if (row) row.qty += 1;
+      else state.cart.push({ id: p.id, title: p.title, price: p.price, qty: 1 });
+      saveCart();
+      renderCart();
+    };
+
+    window.changeQty = function changeQty(index, delta) {
+      const row = state.cart[index];
+      if (!row) return;
+      row.qty += delta;
+      if (row.qty <= 0) state.cart.splice(index, 1);
+      saveCart();
+      renderCart();
+    };
+
+    window.approveOffer = async function approveOffer(id) {
+      try {
+        await api(`/api/sale/offers/${id}/approve`, { method: 'POST', owner: true });
+        await refreshOffers();
+      } catch (err) {
+        alert(err.message);
+      }
+    };
+
+    document.getElementById('searchInput').addEventListener('input', renderCatalog);
+    document.getElementById('categoryFilter').addEventListener('change', renderCatalog);
+    document.getElementById('sortFilter').addEventListener('change', renderCatalog);
+
+    document.querySelectorAll('[data-theme]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const map = {
+          street: { name: 'Street Pulse Shop', tagline: 'Urban trend and fast drops.', accent: '#3dd9b3' },
+          premium: { name: 'Luxe Horizon Shop', tagline: 'Premium catalog, curated quality.', accent: '#d9b35f' },
+          creator: { name: 'Creator Flow Shop', tagline: 'Built for creator-first products.', accent: '#a78bfa' }
+        };
+        state.shop = { ...state.shop, ...(map[btn.dataset.theme] || {}) };
+        applyTheme();
+      });
+    });
+
+    document.getElementById('saveThemeBtn').addEventListener('click', async () => {
+      state.shop.name = document.getElementById('nameInput').value.trim() || state.shop.name;
+      state.shop.tagline = document.getElementById('taglineInput').value.trim() || state.shop.tagline;
+      state.shop.accent = document.getElementById('accentInput').value.trim() || state.shop.accent;
+      try {
+        const res = await api('/api/shop/settings', {
+          method: 'PATCH',
+          owner: true,
+          body: JSON.stringify({
+            name: state.shop.name,
+            tagline: state.shop.tagline,
+            accent: state.shop.accent
+          })
+        });
+        state.shop = res.shop;
+        applyTheme();
+        alert('Style profile saved on backend.');
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('publishSaleBtn').addEventListener('click', async () => {
+      const ask = Number(document.getElementById('askPriceInput').value || 0);
+      const gmv = Number(document.getElementById('gmvInput').value || 0);
+      const traffic = Number(document.getElementById('trafficInput').value || 0);
+      const note = document.getElementById('saleNoteInput').value.trim();
+      if (ask <= 0) {
+        alert('Enter ask price.');
+        return;
+      }
+      try {
+        const res = await api('/api/sale/listing', {
+          method: 'POST',
+          owner: true,
+          body: JSON.stringify({ ask, gmv, traffic, note })
+        });
+        state.saleListing = res.listing;
+        alert('Sale listing published to backend.');
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('checkoutBtn').addEventListener('click', async () => {
+      if (state.cart.length === 0) {
+        alert('Cart is empty.');
+        return;
+      }
+      const email = document.getElementById('emailInput').value.trim();
+      try {
+        const res = await api('/api/checkout', {
+          method: 'POST',
+          body: JSON.stringify({ items: state.cart, email })
+        });
+        state.cart = [];
+        saveCart();
+        renderCart();
+        alert(`Checkout placed.\nOrder #${res.order.id}\nTotal: $${res.order.total.toFixed(2)}`);
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('clearCartBtn').addEventListener('click', () => {
+      state.cart = [];
+      saveCart();
+      renderCart();
+    });
+
+    document.getElementById('ownerTokenInput').addEventListener('change', async () => {
+      persistOwnerToken();
+      await refreshOffers();
+    });
+
+    bootstrap();
+  </script>
+</body>
+</html>
