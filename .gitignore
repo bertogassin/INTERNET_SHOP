@@ -1,0 +1,36 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Node
+node_modules/
+dist/
+build/
+.npm/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Go
+bin/
+*.test
+coverage.out
+
+# Python
+__pycache__/
+*.pyc
+
+# Infra
+.terraform/
+*.tfstate
+*.tfstate.*
