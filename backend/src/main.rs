@@ -1265,8 +1265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let app = Router::new()
-        .route("/health", get(health))
+    let api_routes = Router::new()
         .route("/api/auth/login", post(post_auth_login))
         .route("/api/auth/refresh", post(post_auth_refresh))
         .route("/api/auth/logout", post(post_auth_logout))
@@ -1284,7 +1283,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/sale/offers",
             get(get_sale_offers).post(post_sale_offer),
         )
-        .route("/api/sale/offers/{id}/approve", post(approve_sale_offer))
+        .route("/api/sale/offers/{id}/approve", post(approve_sale_offer));
+    let unprefixed_api_routes = Router::new()
+        .route("/auth/login", post(post_auth_login))
+        .route("/auth/refresh", post(post_auth_refresh))
+        .route("/auth/logout", post(post_auth_logout))
+        .route("/auth/password/change", post(post_auth_password_change))
+        .route("/auth/me", get(get_auth_me))
+        .route("/shop", get(get_shop))
+        .route("/shop/settings", patch(patch_shop_settings))
+        .route("/products", get(get_products).post(post_products))
+        .route("/checkout", post(post_checkout))
+        .route(
+            "/sale/listing",
+            get(get_sale_listing).post(post_sale_listing),
+        )
+        .route("/sale/offers", get(get_sale_offers).post(post_sale_offer))
+        .route("/sale/offers/{id}/approve", post(approve_sale_offer));
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/", get(health))
+        .merge(api_routes)
+        .merge(unprefixed_api_routes)
         .layer(cors_layer)
         .with_state(state);
 
