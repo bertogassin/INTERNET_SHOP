@@ -7,8 +7,7 @@ services:
       branch: main
       deploy_on_push: true
     source_dir: backend
-    build_command: cargo build --release
-    run_command: ./target/release/internet_shop_backend
+    run_command: internet_shop_backend
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xxs
