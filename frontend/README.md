@@ -25,6 +25,7 @@ Open:
 - Storefront catalog via `GET /api/products`
 - Shop theme load/save via `GET /api/shop` and `PATCH /api/shop/settings` (owner/staff)
 - Checkout via `POST /api/checkout`
+- Checkout sends per-attempt `idempotency_key` to avoid duplicate order creation on network retries
 - Sell Shop listing via `GET/POST /api/sale/listing` (`POST` owner)
 - Offers queue and approval via `GET /api/sale/offers` (owner/staff) and `POST /api/sale/offers/:id/approve` (owner)
 

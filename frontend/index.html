@@ -602,10 +602,13 @@
     document.getElementById('checkoutBtn').addEventListener('click', async () => {
       if (state.cart.length === 0) return alert('Cart is empty.');
       const email = document.getElementById('emailInput').value.trim();
+      const idempotencyKey = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
       try {
         const res = await api('/api/checkout', {
           method: 'POST',
-          body: JSON.stringify({ items: state.cart, email })
+          body: JSON.stringify({ items: state.cart, email, idempotency_key: idempotencyKey })
         });
         state.cart = [];
         saveCart();

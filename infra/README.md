@@ -25,3 +25,4 @@ Before production deploy:
 - Set `BOOTSTRAP_OWNER_PASSWORD` to a strong password and `BOOTSTRAP_OWNER_EMAIL` to your real admin email.
 - Replace `CORS_ORIGINS` placeholder with your real frontend domain.
 - Keep `SEED_DEMO_USERS=false`.
+- Backend now fails startup in `APP_ENV=production` if placeholder values are still present for critical secrets/domains.

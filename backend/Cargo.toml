@@ -13,3 +13,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 jsonwebtoken = "9"
 sha2 = "0.10"
 rand = "0.8"
+argon2 = "0.5"

@@ -22,6 +22,7 @@ Auth model:
 - Protected endpoints require `Authorization: Bearer <access_token>`
 - Roles: `owner`, `staff`, `viewer`
 - Login rate-limit: max 8 attempts per 15 minutes per email/ip fingerprint
+- Password storage: `argon2id` with per-password random salt
 - Override signing secret with env:
   - `JWT_SECRET=your-secret cargo run`
 
@@ -51,6 +52,9 @@ Default seeded users (dev only):
 
 Data persistence:
 - SQLite file at `backend/data/store.sqlite` (auto-created on first start).
+- Schema migrations are auto-applied on startup (legacy DBs are upgraded in place).
+- Products include `inventory_qty`, checkout decrements stock atomically.
+- Checkout supports `idempotency_key` to prevent duplicate order creation on retries.
 
 ## Production runtime vars
 

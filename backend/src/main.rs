@@ -5,6 +5,10 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::{distributions::Alphanumeric, Rng};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -168,6 +172,7 @@ struct Product {
     title: String,
     category: String,
     price: f64,
+    inventory_qty: i64,
     popularity: i64,
     desc: String,
 }
@@ -177,6 +182,7 @@ struct ProductCreate {
     title: String,
     category: Option<String>,
     price: f64,
+    inventory_qty: Option<i64>,
     desc: Option<String>,
 }
 
@@ -190,6 +196,7 @@ struct CheckoutItemInput {
 struct CheckoutRequest {
     items: Vec<CheckoutItemInput>,
     email: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -205,6 +212,8 @@ struct OrderResponse {
     id: i64,
     email: String,
     total: f64,
+    status: String,
+    idempotency_key: Option<String>,
     created_at: i64,
     items: Vec<CheckoutItem>,
 }
@@ -256,7 +265,25 @@ fn now_s() -> usize {
         .unwrap_or(0)
 }
 
-fn hash_password(raw: &str) -> String {
+fn hash_password(raw: &str) -> Result<String, ApiError> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(raw.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "password hashing failed"))
+}
+
+fn verify_password(raw: &str, encoded_hash: &str) -> bool {
+    let parsed = match PasswordHash::new(encoded_hash) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    Argon2::default()
+        .verify_password(raw.as_bytes(), &parsed)
+        .is_ok()
+}
+
+fn hash_token(raw: &str) -> String {
     let mut h = Sha256::new();
     h.update(raw.as_bytes());
     format!("{:x}", h.finalize())
@@ -414,6 +441,72 @@ fn enforce_role(user: &AuthUser, allowed: &[Role]) -> Result<(), ApiError> {
     }
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, ApiError> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn run_schema_migrations(conn: &Connection) -> Result<(), ApiError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        [],
+    )?;
+    let applied: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))?;
+    if applied == 0 {
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)",
+            [now_ms()],
+        )?;
+    }
+
+    if !has_column(conn, "products", "inventory_qty")? {
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN inventory_qty INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE products SET inventory_qty = CASE WHEN inventory_qty <= 0 THEN 50 ELSE inventory_qty END",
+            [],
+        )?;
+    }
+
+    if !has_column(conn, "orders", "status")? {
+        conn.execute(
+            "ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'created'",
+            [],
+        )?;
+    }
+    if !has_column(conn, "orders", "idempotency_key")? {
+        conn.execute("ALTER TABLE orders ADD COLUMN idempotency_key TEXT", [])?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key)",
+            [],
+        )?;
+    } else {
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn looks_like_placeholder(value: &str) -> bool {
+    let normalized = value.trim().to_lowercase();
+    normalized.is_empty()
+        || normalized.contains("change-me")
+        || normalized.contains("replace-with")
+        || normalized.contains("example.com")
+        || normalized == "owner@internet.shop"
+}
+
 fn init_schema(
     conn: &Connection,
     seed_demo_users: bool,
@@ -432,6 +525,7 @@ fn init_schema(
           title TEXT NOT NULL,
           category TEXT NOT NULL,
           price REAL NOT NULL,
+          inventory_qty INTEGER NOT NULL DEFAULT 0,
           popularity INTEGER NOT NULL DEFAULT 50,
           desc TEXT NOT NULL DEFAULT '',
           created_at INTEGER NOT NULL
@@ -440,6 +534,8 @@ fn init_schema(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT NOT NULL DEFAULT '',
           total REAL NOT NULL,
+          status TEXT NOT NULL DEFAULT 'created',
+          idempotency_key TEXT UNIQUE,
           created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS order_items (
@@ -485,6 +581,7 @@ fn init_schema(
         );
         "#,
     )?;
+    run_schema_migrations(conn)?;
 
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM products", [], |r| r.get(0))?;
     if count == 0 {
@@ -502,6 +599,7 @@ fn init_schema(
                 "Neo Jacket",
                 "fashion",
                 129.0_f64,
+                30_i64,
                 92_i64,
                 "Urban fit, limited drop.",
             ),
@@ -509,6 +607,7 @@ fn init_schema(
                 "Pulse Headset",
                 "tech",
                 89.0_f64,
+                40_i64,
                 88_i64,
                 "Low-latency wireless sound.",
             ),
@@ -516,6 +615,7 @@ fn init_schema(
                 "Glow Lamp",
                 "home",
                 59.0_f64,
+                50_i64,
                 74_i64,
                 "Ambient adaptive light mode.",
             ),
@@ -523,6 +623,7 @@ fn init_schema(
                 "Street Sneakers",
                 "fashion",
                 109.0_f64,
+                35_i64,
                 95_i64,
                 "Comfort sole for daily wear.",
             ),
@@ -530,6 +631,7 @@ fn init_schema(
                 "Creator Mic",
                 "tech",
                 149.0_f64,
+                25_i64,
                 81_i64,
                 "Clean voice capture for streams.",
             ),
@@ -537,14 +639,15 @@ fn init_schema(
                 "Smart Shelf",
                 "home",
                 79.0_f64,
+                30_i64,
                 70_i64,
                 "Modular shelf with hidden cable path.",
             ),
         ];
         for p in seed_products {
             conn.execute(
-                "INSERT INTO products (title, category, price, popularity, desc, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                params![p.0, p.1, p.2, p.3, p.4, ts],
+                "INSERT INTO products (title, category, price, inventory_qty, popularity, desc, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![p.0, p.1, p.2, p.3, p.4, p.5, ts],
             )?;
         }
         conn.execute(
@@ -572,15 +675,33 @@ fn init_schema(
         let ts = now_ms();
         conn.execute(
             "INSERT INTO users (email, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?)",
-            params!["owner@internet.shop", hash_password("Owner123!"), "owner", "active", ts],
+            params![
+                "owner@internet.shop",
+                hash_password("Owner123!")?,
+                "owner",
+                "active",
+                ts
+            ],
         )?;
         conn.execute(
             "INSERT INTO users (email, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?)",
-            params!["staff@internet.shop", hash_password("Staff123!"), "staff", "active", ts],
+            params![
+                "staff@internet.shop",
+                hash_password("Staff123!")?,
+                "staff",
+                "active",
+                ts
+            ],
         )?;
         conn.execute(
             "INSERT INTO users (email, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?)",
-            params!["viewer@internet.shop", hash_password("Viewer123!"), "viewer", "active", ts],
+            params![
+                "viewer@internet.shop",
+                hash_password("Viewer123!")?,
+                "viewer",
+                "active",
+                ts
+            ],
         )?;
     }
     if users_count == 0 && !seed_demo_users {
@@ -588,7 +709,13 @@ fn init_schema(
             let ts = now_ms();
             conn.execute(
                 "INSERT INTO users (email, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?)",
-                params![email.trim().to_lowercase(), hash_password(password), "owner", "active", ts],
+                params![
+                    email.trim().to_lowercase(),
+                    hash_password(password)?,
+                    "owner",
+                    "active",
+                    ts
+                ],
             )?;
         } else {
             return Err(ApiError::new(
@@ -644,7 +771,7 @@ async fn post_auth_login(
             ));
         }
     };
-    if status != "active" || db_hash != hash_password(&password) {
+    if status != "active" || !verify_password(&password, &db_hash) {
         mark_login_failure(&state, &fp).await;
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -656,7 +783,7 @@ async fn post_auth_login(
         .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid role"))?;
 
     let refresh = random_token(64);
-    let refresh_hash = hash_password(&refresh);
+    let refresh_hash = hash_token(&refresh);
     let now = now_ms();
     conn.execute(
         "INSERT INTO auth_sessions (user_id, refresh_hash, status, created_at, expires_at, last_seen_at) VALUES (?, ?, 'active', ?, ?, ?)",
@@ -687,7 +814,7 @@ async fn post_auth_refresh(
             "refresh token required",
         ));
     }
-    let token_hash = hash_password(&token);
+    let token_hash = hash_token(&token);
     let conn = state.db.lock().await;
     let row: Option<(i64, i64, i64, String, String, String)> = conn
         .query_row(
@@ -714,7 +841,7 @@ async fn post_auth_refresh(
     let now = now_ms();
     conn.execute(
         "UPDATE auth_sessions SET refresh_hash=?, expires_at=?, last_seen_at=? WHERE id=?",
-        params![hash_password(&next_refresh), now + REFRESH_TTL_MS, now, sid],
+        params![hash_token(&next_refresh), now + REFRESH_TTL_MS, now, sid],
     )?;
     let access = issue_access_token(&state, uid, &email, role, sid)?;
     Ok(Json(TokensResponse {
@@ -735,7 +862,7 @@ async fn post_auth_logout(
         params![now_ms(), ctx.session_id],
     )?;
     if let Some(refresh) = payload.refresh_token {
-        let hash = hash_password(refresh.trim());
+        let hash = hash_token(refresh.trim());
         conn.execute(
             "UPDATE auth_sessions SET status='revoked', last_seen_at=? WHERE refresh_hash=?",
             params![now_ms(), hash],
@@ -764,7 +891,7 @@ async fn post_auth_password_change(
         [ctx.user.id],
         |r| r.get(0),
     )?;
-    if old_hash != hash_password(&current) {
+    if !verify_password(&current, &old_hash) {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "current password is incorrect",
@@ -772,7 +899,7 @@ async fn post_auth_password_change(
     }
     conn.execute(
         "UPDATE users SET password_hash=? WHERE id=?",
-        params![hash_password(&next), ctx.user.id],
+        params![hash_password(&next)?, ctx.user.id],
     )?;
     conn.execute(
         "UPDATE auth_sessions SET status='revoked', last_seen_at=? WHERE user_id=?",
@@ -882,7 +1009,7 @@ async fn patch_shop_settings(
 async fn get_products(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let conn = state.db.lock().await;
     let mut stmt = conn.prepare(
-        "SELECT id, title, category, price, popularity, desc FROM products ORDER BY id DESC",
+        "SELECT id, title, category, price, inventory_qty, popularity, desc FROM products ORDER BY id DESC",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(Product {
@@ -890,8 +1017,9 @@ async fn get_products(State(state): State<AppState>) -> Result<Json<Value>, ApiE
             title: r.get(1)?,
             category: r.get(2)?,
             price: r.get(3)?,
-            popularity: r.get(4)?,
-            desc: r.get(5)?,
+            inventory_qty: r.get(4)?,
+            popularity: r.get(5)?,
+            desc: r.get(6)?,
         })
     })?;
     let mut products = Vec::new();
@@ -915,13 +1043,21 @@ async fn post_products(
             "title and non-negative price required",
         ));
     }
+    let inventory_qty = payload.inventory_qty.unwrap_or(0);
+    if inventory_qty < 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "inventory quantity must be non-negative",
+        ));
+    }
     let conn = state.db.lock().await;
     conn.execute(
-        "INSERT INTO products (title, category, price, popularity, desc, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO products (title, category, price, inventory_qty, popularity, desc, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         params![
             title,
             payload.category.unwrap_or_else(|| "general".to_string()).trim().to_string(),
             payload.price,
+            inventory_qty,
             50_i64,
             payload.desc.unwrap_or_default().trim().to_string(),
             now_ms()
@@ -929,7 +1065,7 @@ async fn post_products(
     )?;
     let id = conn.last_insert_rowid();
     let product: Product = conn.query_row(
-        "SELECT id, title, category, price, popularity, desc FROM products WHERE id=?",
+        "SELECT id, title, category, price, inventory_qty, popularity, desc FROM products WHERE id=?",
         [id],
         |r| {
             Ok(Product {
@@ -937,8 +1073,9 @@ async fn post_products(
                 title: r.get(1)?,
                 category: r.get(2)?,
                 price: r.get(3)?,
-                popularity: r.get(4)?,
-                desc: r.get(5)?,
+                inventory_qty: r.get(4)?,
+                popularity: r.get(5)?,
+                desc: r.get(6)?,
             })
         },
     )?;
@@ -952,21 +1089,80 @@ async fn post_checkout(
     if payload.items.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "items required"));
     }
+    let idempotency_key = payload
+        .idempotency_key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
     let mut conn = state.db.lock().await;
+
+    if let Some(existing_key) = idempotency_key.as_ref() {
+        let existing_order_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM orders WHERE idempotency_key = ?",
+                [existing_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(order_id) = existing_order_id {
+            let mut stmt = conn.prepare(
+                "SELECT product_id, title, price, qty FROM order_items WHERE order_id=? ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map([order_id], |r| {
+                Ok(CheckoutItem {
+                    product_id: r.get(0)?,
+                    title: r.get(1)?,
+                    price: r.get(2)?,
+                    qty: r.get(3)?,
+                })
+            })?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+            let order: OrderResponse = conn.query_row(
+                "SELECT id, email, total, status, idempotency_key, created_at FROM orders WHERE id=?",
+                [order_id],
+                |r| {
+                    Ok(OrderResponse {
+                        id: r.get(0)?,
+                        email: r.get(1)?,
+                        total: r.get(2)?,
+                        status: r.get(3)?,
+                        idempotency_key: r.get(4)?,
+                        created_at: r.get(5)?,
+                        items: Vec::new(),
+                    })
+                },
+            )?;
+            let existing_order = OrderResponse { items, ..order };
+            return Ok((
+                StatusCode::OK,
+                Json(json!({ "ok": true, "order": existing_order, "idempotent_replay": true })),
+            ));
+        }
+    }
+
     let mut normalized = Vec::<CheckoutItem>::new();
     let mut total = 0.0_f64;
+    let mut inventory_deltas = Vec::<(i64, i64)>::new();
     for item in payload.items {
         if item.qty <= 0 {
             continue;
         }
-        let row: Option<(i64, String, f64)> = conn
+        let row: Option<(i64, String, f64, i64)> = conn
             .query_row(
-                "SELECT id, title, price FROM products WHERE id=?",
+                "SELECT id, title, price, inventory_qty FROM products WHERE id=?",
                 [item.id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        if let Some((id, title, price)) = row {
+        if let Some((id, title, price, inventory_qty)) = row {
+            if inventory_qty < item.qty {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!("insufficient stock for product {id}"),
+                ));
+            }
             total += price * item.qty as f64;
             normalized.push(CheckoutItem {
                 product_id: id,
@@ -974,6 +1170,7 @@ async fn post_checkout(
                 price,
                 qty: item.qty,
             });
+            inventory_deltas.push((id, item.qty));
         }
     }
     if normalized.is_empty() {
@@ -983,8 +1180,13 @@ async fn post_checkout(
     let email = payload.email.unwrap_or_default().trim().to_string();
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO orders (email, total, created_at) VALUES (?, ?, ?)",
-        params![email, (total * 100.0).round() / 100.0, created_at],
+        "INSERT INTO orders (email, total, status, idempotency_key, created_at) VALUES (?, ?, 'created', ?, ?)",
+        params![
+            email,
+            (total * 100.0).round() / 100.0,
+            idempotency_key.clone(),
+            created_at
+        ],
     )?;
     let order_id = tx.last_insert_rowid();
     for it in &normalized {
@@ -993,11 +1195,19 @@ async fn post_checkout(
             params![order_id, it.product_id, it.title, it.price, it.qty],
         )?;
     }
+    for (product_id, qty) in &inventory_deltas {
+        tx.execute(
+            "UPDATE products SET inventory_qty = inventory_qty - ? WHERE id=?",
+            params![qty, product_id],
+        )?;
+    }
     tx.commit()?;
     let order = OrderResponse {
         id: order_id,
         email,
         total: (total * 100.0).round() / 100.0,
+        status: "created".to_string(),
+        idempotency_key,
         created_at,
         items: normalized,
     };
@@ -1210,9 +1420,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    let cors_origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
 
     if app_env == "production" && jwt_secret == "dev-jwt-secret-change-me" {
         return Err("JWT_SECRET must be set in production".into());
+    }
+    if app_env == "production" {
+        if seed_demo_users {
+            return Err("SEED_DEMO_USERS must be false in production".into());
+        }
+        if looks_like_placeholder(&jwt_secret) {
+            return Err("JWT_SECRET looks like placeholder; set strong secret".into());
+        }
+        if cors_origins.trim().is_empty() || looks_like_placeholder(&cors_origins) {
+            return Err("CORS_ORIGINS must be set to real frontend domain in production".into());
+        }
+        match bootstrap_owner.as_ref() {
+            Some((email, password))
+                if !looks_like_placeholder(email) && !looks_like_placeholder(password) => {}
+            _ => {
+                return Err(
+                    "BOOTSTRAP_OWNER_EMAIL and BOOTSTRAP_OWNER_PASSWORD must be real non-placeholder values in production"
+                        .into(),
+                )
+            }
+        }
     }
 
     let db_file = PathBuf::from(&db_path);
@@ -1239,8 +1471,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let cors_origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
     let cors_layer = if cors_origins.trim().is_empty() {
+        if app_env == "production" {
+            return Err("CORS_ORIGINS required in production".into());
+        }
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -1253,6 +1487,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_map(|s| s.parse::<HeaderValue>().ok())
             .collect();
         if origins.is_empty() {
+            if app_env == "production" {
+                return Err("No valid CORS origins parsed from CORS_ORIGINS".into());
+            }
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
@@ -1325,4 +1562,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_hash_roundtrip_works() {
+        let raw = "VeryStrongPassword#2026";
+        let encoded = hash_password(raw).expect("hashing should succeed");
+        assert_ne!(encoded, raw);
+        assert!(verify_password(raw, &encoded));
+        assert!(!verify_password("wrong-password", &encoded));
+    }
+
+    #[test]
+    fn init_schema_creates_required_columns() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        init_schema(
+            &conn,
+            false,
+            Some(("owner@test.local", "OwnerPassword#2026")),
+        )
+        .expect("schema init");
+
+        assert!(has_column(&conn, "products", "inventory_qty").expect("column lookup"));
+        assert!(has_column(&conn, "orders", "status").expect("column lookup"));
+        assert!(has_column(&conn, "orders", "idempotency_key").expect("column lookup"));
+    }
+
+    #[test]
+    fn migration_upgrades_legacy_schema() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE products (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              title TEXT NOT NULL,
+              category TEXT NOT NULL,
+              price REAL NOT NULL,
+              popularity INTEGER NOT NULL DEFAULT 50,
+              desc TEXT NOT NULL DEFAULT '',
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE orders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              email TEXT NOT NULL DEFAULT '',
+              total REAL NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            "#,
+        )
+        .expect("legacy schema");
+
+        run_schema_migrations(&conn).expect("migration run");
+        assert!(has_column(&conn, "products", "inventory_qty").expect("column lookup"));
+        assert!(has_column(&conn, "orders", "status").expect("column lookup"));
+        assert!(has_column(&conn, "orders", "idempotency_key").expect("column lookup"));
+    }
 }

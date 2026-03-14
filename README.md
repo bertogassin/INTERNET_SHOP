@@ -26,6 +26,9 @@ docs/           # contracts, rollout, security notes
 ## Production readiness
 
 - Rust backend with JWT auth, RBAC, refresh/logout/password-change flows.
+- Argon2id password hashing and rotating refresh-token sessions.
+- Startup schema migrations for backward-compatible SQLite upgrades.
+- Checkout idempotency and inventory deduction safeguards.
 - Frontend connected to backend API with refresh-token retry flow.
 - Dockerized backend runtime for deployment.
 - DigitalOcean App Platform spec in `infra/digitalocean-app.yaml`.
