@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   secret-scan:
     runs-on: ubuntu-latest
@@ -12,36 +15,70 @@ jobs:
       - uses: actions/checkout@v4
       - name: gitleaks
         uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   dependency-and-build-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
-        if: ${{ hashFiles('**/package.json') != '' }}
         with:
           node-version: '20'
       - uses: actions/setup-go@v5
-        if: ${{ hashFiles('**/go.mod') != '' }}
         with:
           go-version: '1.22'
+
       - name: Setup Rust
-        if: ${{ hashFiles('**/Cargo.toml') != '' }}
         run: rustup default stable
 
-      - name: Rust checks
-        if: ${{ hashFiles('**/Cargo.toml') != '' }}
+      - name: Rust checks (all Cargo manifests)
+        shell: bash
         run: |
-          cargo fmt --all -- --check || true
-          cargo check --all-targets
+          set -euo pipefail
+          mapfile -t manifests < <(git ls-files '**/Cargo.toml' 'Cargo.toml')
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo "No Cargo.toml found"
+            exit 0
+          fi
+          for manifest in "${manifests[@]}"; do
+            dir=$(dirname "$manifest")
+            echo "Running cargo check in $dir"
+            (cd "$dir" && cargo check --all-targets)
+          done
 
-      - name: Go checks
-        if: ${{ hashFiles('**/go.mod') != '' }}
+      - name: Go checks (all modules)
+        shell: bash
         run: |
-          go test ./...
+          set -euo pipefail
+          mapfile -t gomods < <(git ls-files '**/go.mod' 'go.mod')
+          if [ ${#gomods[@]} -eq 0 ]; then
+            echo "No go.mod found"
+            exit 0
+          fi
+          for mod in "${gomods[@]}"; do
+            dir=$(dirname "$mod")
+            echo "Running go test in $dir"
+            (cd "$dir" && go test ./...)
+          done
 
-      - name: Node checks
-        if: ${{ hashFiles('**/package.json') != '' }}
+      - name: Node checks (all package manifests)
+        shell: bash
         run: |
-          npm ci
-          npm audit --audit-level=high || true
+          set -euo pipefail
+          mapfile -t pkgs < <(git ls-files '**/package.json' 'package.json')
+          if [ ${#pkgs[@]} -eq 0 ]; then
+            echo "No package.json found"
+            exit 0
+          fi
+          for pkg in "${pkgs[@]}"; do
+            dir=$(dirname "$pkg")
+            echo "Running npm checks in $dir"
+            if [ -f "$dir/package-lock.json" ]; then
+              (cd "$dir" && npm ci)
+            else
+              (cd "$dir" && npm install)
+            fi
+            (cd "$dir" && npm audit --audit-level=high || true)
+          done
