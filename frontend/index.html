@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Internet Shop MVP</title>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>Internet Shop</title>
   <style>
     :root {
       --bg: #090d14;
@@ -35,6 +38,7 @@
       border-radius: 14px;
       background: rgba(18, 26, 42, 0.9);
       padding: 14px;
+      box-shadow: 0 12px 30px rgba(8, 15, 28, 0.3);
     }
     .kicker {
       margin: 0;
@@ -52,6 +56,18 @@
       justify-content: space-between;
       gap: 8px;
       flex-wrap: wrap;
+    }
+    .releaseBadge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      background: rgba(61, 217, 179, 0.08);
+      margin-top: 8px;
     }
     .btn {
       display: inline-flex;
@@ -177,9 +193,10 @@
       <article class="panel stack">
         <div class="heroRow">
           <div>
-            <p class="kicker">Internet Shop MVP</p>
+            <p class="kicker">Internet Shop | Production build</p>
             <h1 id="shopName">Street Pulse Shop</h1>
             <p id="shopTagline" class="muted">Trend-first storefront with flexible style and sell-shop module.</p>
+            <p class="releaseBadge">Release 2026.03.14 · Build 2</p>
           </div>
           <a class="btn" href="https://github.com/bertogassin/INTERNET_SHOP" target="_blank" rel="noreferrer">Repository</a>
         </div>
