@@ -7,17 +7,23 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   secret-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="8.24.3"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/gitleaks_${ver}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          tar -xzf /tmp/gitleaks.tgz -C /tmp
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Run gitleaks
+        run: gitleaks detect --source . --redact --no-banner --exit-code 1
 
   dependency-and-build-checks:
     runs-on: ubuntu-latest
@@ -83,4 +89,3 @@ jobs:
             fi
             (cd "$dir" && npm audit --audit-level=high || true)
           done
-
